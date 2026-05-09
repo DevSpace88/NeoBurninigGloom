@@ -535,35 +535,51 @@ func GDIToCUE(gdiPath, outputPath string) ([]string, error) {
 
 	binName := filepath.Base(outputPath)
 
+	// First pass: calculate track sizes and BIN offsets
+	type trackEntry struct {
+		track     img.GDITrack
+		binOffset int64 // byte offset within merged BIN
+		sectors   int64
+	}
+	var entries []trackEntry
+	var binOffset int64
+
+	for _, track := range gdi.Tracks {
+		sectors := track.FileSize / int64(track.SectorSize)
+		entries = append(entries, trackEntry{track: track, binOffset: binOffset, sectors: sectors})
+		binOffset += track.FileSize
+	}
+
 	var cue strings.Builder
 	cue.WriteString(fmt.Sprintf("FILE \"%s\" BINARY\n", binName))
 
-	for i, track := range gdi.Tracks {
-		trackPath := filepath.Join(gdiDir, track.Filename)
-
+	for i, entry := range entries {
 		mode := "AUDIO"
-		if track.Flags == 4 {
+		if entry.track.Flags == 4 {
 			mode = "MODE2/2352"
-			if track.SectorSize == 2048 {
+			if entry.track.SectorSize == 2048 {
 				mode = "MODE1/2048"
 			}
 		}
 
-		cue.WriteString(fmt.Sprintf("  TRACK %02d %s\n", track.Number, mode))
+		cue.WriteString(fmt.Sprintf("  TRACK %02d %s\n", entry.track.Number, mode))
 
-		if i == 0 && track.Flags != 4 {
+		if i == 0 && entry.track.Flags != 4 {
 			cue.WriteString("    PREGAP 00:02:00\n")
 		}
 
-		cue.WriteString(fmt.Sprintf("    INDEX 01 %s\n", lbaToMSF(track.StartLBA)))
+		// INDEX 01 = byte offset in BIN converted to MSF using sector size
+		sectorOffset := entry.binOffset / int64(entry.track.SectorSize)
+		cue.WriteString(fmt.Sprintf("    INDEX 01 %s\n", lbaToMSF(sectorOffset)))
 
+		trackPath := filepath.Join(gdiDir, entry.track.Filename)
 		tf, err := os.Open(trackPath)
 		if err != nil {
-			return nil, fmt.Errorf("open track %d (%s): %w", track.Number, track.Filename, err)
+			return nil, fmt.Errorf("open track %d (%s): %w", entry.track.Number, entry.track.Filename, err)
 		}
 		if _, err := io.Copy(binFile, tf); err != nil {
 			tf.Close()
-			return nil, fmt.Errorf("copy track %d: %w", track.Number, err)
+			return nil, fmt.Errorf("copy track %d: %w", entry.track.Number, err)
 		}
 		tf.Close()
 	}

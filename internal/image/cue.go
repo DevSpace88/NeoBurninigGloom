@@ -44,32 +44,71 @@ func analyzeCUE(info *ImageInfo) (*ImageInfo, error) {
 	}
 
 	var tracks []TrackInfo
-	for _, ct := range cue.Tracks {
+	for i, ct := range cue.Tracks {
 		trackType := "Audio"
+		sectorSize := 2352
 		if strings.HasPrefix(ct.DataType, "MODE1") {
 			trackType = "Mode1"
+			if strings.HasSuffix(ct.DataType, "/2048") {
+				sectorSize = 2048
+			}
 		} else if strings.HasPrefix(ct.DataType, "MODE2") {
 			trackType = "Mode2"
+			if strings.HasSuffix(ct.DataType, "/2336") {
+				sectorSize = 2336
+			}
 		}
 
 		tracks = append(tracks, TrackInfo{
-			Number:   ct.Number,
-			Type:     trackType,
-			StartLBA: ct.Index01LBA,
+			Number:    ct.Number,
+			Type:      trackType,
+			StartLBA:  ct.Index01LBA,
+			Sectors:   0,
+			SizeBytes: 0,
 		})
+
+		// Set sector size in RawDetails for later size calculation
+		_ = sectorSize
+		_ = i
+	}
+
+	// Calculate track sizes from BIN file + CUE indices
+	binPath := FindBINForCUE(info.Path, cue)
+	if binPath != "" {
+		if stat, err := os.Stat(binPath); err == nil {
+			info.Size = stat.Size()
+			binSize := stat.Size()
+
+			// Determine sector size from first track's mode
+			defaultSectorSize := 2352
+			if len(cue.Tracks) > 0 {
+				if strings.HasSuffix(cue.Tracks[0].DataType, "/2048") {
+					defaultSectorSize = 2048
+				} else if strings.HasSuffix(cue.Tracks[0].DataType, "/2336") {
+					defaultSectorSize = 2336
+				}
+			}
+
+			for i := range tracks {
+				startByte := tracks[i].StartLBA * int64(defaultSectorSize)
+				var endByte int64
+				if i+1 < len(tracks) {
+					endByte = tracks[i+1].StartLBA * int64(defaultSectorSize)
+				} else {
+					endByte = binSize
+				}
+				if endByte > startByte {
+					trackBytes := endByte - startByte
+					tracks[i].SizeBytes = trackBytes
+					tracks[i].Sectors = trackBytes / int64(defaultSectorSize)
+				}
+			}
+		}
 	}
 
 	info.Tracks = tracks
 	info.Sessions = 1
 	info.Platform = detectCUEPlatform(tracks)
-
-	// Find and stat the BIN file for size info
-	binPath := FindBINForCUE(info.Path, cue)
-	if binPath != "" {
-		if stat, err := os.Stat(binPath); err == nil {
-			info.Size = stat.Size()
-		}
-	}
 
 	if info.RawDetails == nil {
 		info.RawDetails = make(map[string]string)
