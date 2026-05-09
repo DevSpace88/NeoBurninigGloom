@@ -19,6 +19,7 @@ const (
 	FormatXISO    Format = "XISO"
 	FormatMDS     Format = "MDS"
 	FormatCCD     Format = "CCD"
+	FormatGDI     Format = "GDI"
 	FormatUnknown Format = "Unknown"
 )
 
@@ -54,6 +55,8 @@ func DetectFormat(path string) (Format, error) {
 		return FormatMDS, nil
 	case strings.HasSuffix(ext, ".CCD"):
 		return FormatCCD, nil
+	case strings.HasSuffix(ext, ".GDI"):
+		return FormatGDI, nil
 	case strings.HasSuffix(ext, ".XISO") || strings.HasSuffix(ext, ".ISO"):
 		f, err := os.Open(path)
 		if err != nil {
@@ -131,6 +134,8 @@ func Analyze(path string) (*ImageInfo, error) {
 		return analyzeXISO(info)
 	case FormatNRG:
 		return analyzeNRG(info)
+	case FormatGDI:
+		return analyzeGDI(info)
 	default:
 		return info, nil
 	}

@@ -308,7 +308,7 @@ func openFilePicker() (string, error) {
 	switch runtime.GOOS {
 	case "darwin":
 		out, err := exec.Command("osascript", "-e",
-			`POSIX path of (choose file with prompt "Select disc image" of type {"iso", "bin", "cdi", "cue", "nrg", "img", "mds", "ccd"})`).Output()
+			`POSIX path of (choose file with prompt "Select disc image" of type {"iso", "bin", "cdi", "cue", "nrg", "img", "mds", "ccd", "gdi"})`).Output()
 		if err != nil {
 			return "", err
 		}
@@ -316,7 +316,7 @@ func openFilePicker() (string, error) {
 	case "linux":
 		out, err := exec.Command("zenity", "--file-selection",
 			"--title=Select disc image",
-			"--file-filter=Disc Images | *.iso *.bin *.cdi *.cue *.nrg *.img *.mds *.ccd",
+			"--file-filter=Disc Images | *.iso *.bin *.cdi *.cue *.nrg *.img *.mds *.ccd *.gdi",
 			"--file-filter=All files | *").Output()
 		if err != nil {
 			return "", err
@@ -324,7 +324,7 @@ func openFilePicker() (string, error) {
 		return strings.TrimSpace(string(out)), nil
 	case "windows":
 		// PowerShell file dialog
-		script := `Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog; $f.Filter = 'Disc Images|*.iso;*.bin;*.cdi;*.cue;*.nrg;*.img;*.mds;*.ccd|All Files|*.*'; if ($f.ShowDialog() -eq 'OK') { $f.FileName }`
+		script := `Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog; $f.Filter = 'Disc Images|*.iso;*.bin;*.cdi;*.cue;*.nrg;*.img;*.mds;*.ccd;*.gdi|All Files|*.*'; if ($f.ShowDialog() -eq 'OK') { $f.FileName }`
 		out, err := exec.Command("powershell", "-Command", script).Output()
 		if err != nil {
 			return "", err
