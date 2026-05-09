@@ -1,4 +1,12 @@
-/.idea
-/.crush
-
-
+.idea/
+.crush/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+neo
+neoburninggoom
+vendor/
