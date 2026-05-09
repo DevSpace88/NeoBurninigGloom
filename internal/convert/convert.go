@@ -66,7 +66,163 @@ func convertToCUEBIN(srcPath, outputPath string, srcFormat img.Format) ([]string
 }
 
 func convertToISO(srcPath, outputPath string, srcFormat img.Format) ([]string, error) {
-	return nil, fmt.Errorf("conversion from %s to ISO not yet supported", srcFormat)
+	switch srcFormat {
+	case img.FormatCUE:
+		return CUEToISO(srcPath, outputPath)
+	case img.FormatBIN:
+		return BINToISO(srcPath, outputPath)
+	default:
+		return nil, fmt.Errorf("conversion from %s to ISO not yet supported", srcFormat)
+	}
+}
+
+func CUEToISO(cuePath, outputPath string) ([]string, error) {
+	cue, err := img.ParseCUE(cuePath)
+	if err != nil {
+		return nil, fmt.Errorf("parse CUE: %w", err)
+	}
+
+	binPath := img.FindBINForCUE(cuePath, cue)
+	if binPath == "" {
+		return nil, fmt.Errorf("BIN file not found for %s", cuePath)
+	}
+
+	return binDataToISO(binPath, cue.Tracks, outputPath)
+}
+
+func BINToISO(binPath, outputPath string) ([]string, error) {
+	return binDataToISO(binPath, nil, outputPath)
+}
+
+func binDataToISO(binPath string, tracks []img.CUETrack, outputPath string) ([]string, error) {
+	if outputPath == "" {
+		outputPath = strings.TrimSuffix(binPath, filepath.Ext(binPath)) + ".iso"
+	}
+	if !strings.HasSuffix(strings.ToLower(outputPath), ".iso") {
+		outputPath += ".iso"
+	}
+
+	binFile, err := os.Open(binPath)
+	if err != nil {
+		return nil, fmt.Errorf("open BIN: %w", err)
+	}
+	defer binFile.Close()
+
+	binStat, err := binFile.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	isoFile, err := os.Create(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("create ISO: %w", err)
+	}
+	defer isoFile.Close()
+
+	// If we have CUE track info, extract only data tracks
+	if len(tracks) > 0 {
+		for _, track := range tracks {
+			if strings.HasPrefix(track.DataType, "MODE1") || strings.HasPrefix(track.DataType, "MODE2") {
+				sectorSize := sectorSizeFromMode(track.DataType)
+				userDataSize := 2048
+				offset := userDataOffset(track.DataType)
+
+				startByte := track.Index01LBA * int64(sectorSize)
+				if startByte >= binStat.Size() {
+					continue
+				}
+
+				if _, err := binFile.Seek(startByte, io.SeekStart); err != nil {
+					return nil, fmt.Errorf("seek to track %d: %w", track.Number, err)
+				}
+
+				buf := make([]byte, sectorSize)
+				for {
+					if _, err := io.ReadFull(binFile, buf); err != nil {
+						if err == io.ErrUnexpectedEOF || err == io.EOF {
+							break
+						}
+						return nil, fmt.Errorf("read sector: %w", err)
+					}
+					if _, err := isoFile.Write(buf[offset : offset+userDataSize]); err != nil {
+						return nil, fmt.Errorf("write ISO sector: %w", err)
+					}
+				}
+				break
+			}
+		}
+	} else {
+		// No CUE info — try to auto-detect sector size
+		sectorSize := detectSectorSize(binFile, binStat.Size())
+
+		if sectorSize == 2048 {
+			// Already raw user data, just copy
+			binFile.Seek(0, io.SeekStart)
+			_, err := io.Copy(isoFile, binFile)
+			if err != nil {
+				return nil, fmt.Errorf("copy: %w", err)
+			}
+		} else {
+			// MODE1/2352 assumed — user data at offset 16
+			offset := 16
+			userDataSize := 2048
+
+			buf := make([]byte, sectorSize)
+			for {
+				if _, err := io.ReadFull(binFile, buf); err != nil {
+					if err == io.ErrUnexpectedEOF || err == io.EOF {
+						break
+					}
+					return nil, fmt.Errorf("read sector: %w", err)
+				}
+				if _, err := isoFile.Write(buf[offset : offset+userDataSize]); err != nil {
+					return nil, fmt.Errorf("write ISO sector: %w", err)
+				}
+			}
+		}
+	}
+
+	return []string{outputPath}, nil
+}
+
+func sectorSizeFromMode(mode string) int {
+	switch strings.ToUpper(mode) {
+	case "MODE1/2048":
+		return 2048
+	case "MODE1/2352":
+		return 2352
+	case "MODE2/2336":
+		return 2336
+	case "MODE2/2352":
+		return 2352
+	default:
+		return 2352
+	}
+}
+
+func userDataOffset(mode string) int {
+	switch strings.ToUpper(mode) {
+	case "MODE1/2048":
+		return 0
+	case "MODE1/2352":
+		return 16
+	case "MODE2/2336":
+		return 8
+	case "MODE2/2352":
+		return 24
+	default:
+		return 16
+	}
+}
+
+func detectSectorSize(f *os.File, fileSize int64) int {
+	if fileSize%2352 == 0 && fileSize%2048 != 0 {
+		return 2352
+	}
+	if fileSize%2336 == 0 && fileSize%2048 != 0 {
+		return 2336
+	}
+	return 2048
 }
 
 // CDI to CUE/BIN converter.
