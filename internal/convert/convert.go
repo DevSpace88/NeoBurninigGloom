@@ -5,10 +5,69 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	img "NeoBurningGoom/internal/image"
 )
+
+// SupportedConversions returns what output formats are available for a given input format.
+func SupportedConversions(format img.Format) []string {
+	switch format {
+	case img.FormatCDI:
+		return []string{"CUE/BIN", "ISO"}
+	case img.FormatISO:
+		return []string{"CUE/BIN"}
+	case img.FormatNRG:
+		return []string{"CUE/BIN", "ISO"}
+	case img.FormatCUE:
+		return []string{"ISO"}
+	case img.FormatBIN:
+		return []string{"ISO"}
+	default:
+		return nil
+	}
+}
+
+// Convert converts a source image to the target format.
+func Convert(srcPath, outputPath, targetFormat string) (outPaths []string, err error) {
+	srcFormat, err := img.DetectFormat(srcPath)
+	if err != nil {
+		return nil, fmt.Errorf("detect format: %w", err)
+	}
+
+	switch targetFormat {
+	case "CUE/BIN":
+		return convertToCUEBIN(srcPath, outputPath, srcFormat)
+	case "ISO":
+		return convertToISO(srcPath, outputPath, srcFormat)
+	default:
+		return nil, fmt.Errorf("unsupported target format: %s", targetFormat)
+	}
+}
+
+func convertToCUEBIN(srcPath, outputPath string, srcFormat img.Format) ([]string, error) {
+	switch srcFormat {
+	case img.FormatCDI:
+		cue, bin, err := CDIToCUE(srcPath, outputPath)
+		if err != nil {
+			return nil, err
+		}
+		return []string{cue, bin}, nil
+	case img.FormatISO:
+		cue, bin, err := ISOToCUE(srcPath, outputPath)
+		if err != nil {
+			return nil, err
+		}
+		return []string{cue, bin}, nil
+	default:
+		return nil, fmt.Errorf("conversion from %s to CUE/BIN not yet supported", srcFormat)
+	}
+}
+
+func convertToISO(srcPath, outputPath string, srcFormat img.Format) ([]string, error) {
+	return nil, fmt.Errorf("conversion from %s to ISO not yet supported", srcFormat)
+}
 
 // CDI to CUE/BIN converter.
 // Extracts track layout from CDI and generates a CUE sheet + raw BIN file.
@@ -44,11 +103,12 @@ func CDIToCUE(cdiPath, outputPath string) (cuePath string, binPath string, err e
 	}
 	defer binFile.Close()
 
-	// Generate CUE path
-	cuePath = strings.TrimSuffix(outputPath, ".bin") + ".cue"
-	if strings.HasSuffix(strings.ToLower(outputPath), ".img") {
-		cuePath = strings.TrimSuffix(outputPath, ".img") + ".cue"
+	// Generate CUE path — strip any extension, then add .cue
+	base := outputPath
+	if idx := strings.LastIndex(base, "."); idx >= 0 {
+		base = base[:idx]
 	}
+	cuePath = base + ".cue"
 	binName := outputPath
 	if strings.Contains(binName, "/") || strings.Contains(binName, "\\") {
 		parts := strings.Split(binName, "/")
@@ -92,35 +152,63 @@ func CDIToCUE(cdiPath, outputPath string) (cuePath string, binPath string, err e
 		return "", "", fmt.Errorf("write CUE: %w", err)
 	}
 
-	return cuePath, binPath, nil
+	return cuePath, outputPath, nil
 }
 
 func ISOToCUE(isoPath, outputPath string) (cuePath string, binPath string, err error) {
-	if outputPath == "" {
-		outputPath = strings.TrimSuffix(isoPath, ".iso")
+	// Copy ISO data to a .bin file and create a matching CUE sheet.
+	// ISO is Mode1/2048 — we write a CUE that correctly describes it.
+
+	src, err := os.Open(isoPath)
+	if err != nil {
+		return "", "", fmt.Errorf("open ISO: %w", err)
 	}
+	defer src.Close()
 
-	cuePath = outputPath + ".cue"
-	binPath = isoPath // the ISO itself is the data source
-
-	binName := isoPath
-	if strings.Contains(binName, "/") || strings.Contains(binName, "\\") {
-		parts := strings.Split(binName, "/")
-		if ws := strings.Split(binName, "\\"); len(ws) > len(parts) {
-			parts = ws
-		}
-		binName = parts[len(parts)-1]
-	}
-
-	var cue strings.Builder
-	cue.WriteString(fmt.Sprintf("FILE \"%s\" BINARY\n", binName))
-	cue.WriteString("  TRACK 01 MODE1/2048\n")
-	cue.WriteString("    INDEX 01 00:00:00\n")
-
-	if err := os.WriteFile(cuePath, []byte(cue.String()), 0644); err != nil {
+	srcStat, err := src.Stat()
+	if err != nil {
 		return "", "", err
 	}
 
+	// Determine BIN output path
+	if outputPath == "" {
+		outputPath = strings.TrimSuffix(isoPath, filepath.Ext(isoPath)) + ".bin"
+	}
+	base := outputPath
+	if idx := strings.LastIndex(base, "."); idx >= 0 {
+		base = base[:idx]
+	}
+	binPath = base + ".bin"
+	cuePath = base + ".cue"
+
+	// Copy ISO → BIN
+	binFile, err := os.Create(binPath)
+	if err != nil {
+		return "", "", fmt.Errorf("create BIN: %w", err)
+	}
+	defer binFile.Close()
+
+	if _, err := io.Copy(binFile, src); err != nil {
+		os.Remove(binPath)
+		return "", "", fmt.Errorf("write BIN: %w", err)
+	}
+
+	// Build CUE — MODE1/2048 since the ISO data is raw user data (2048 bytes/sector)
+	totalSectors := srcStat.Size() / 2048
+	indexMSF := lbaToMSF(0)
+
+	binName := filepath.Base(binPath)
+	var cue strings.Builder
+	cue.WriteString(fmt.Sprintf("FILE \"%s\" BINARY\n", binName))
+	cue.WriteString("  TRACK 01 MODE1/2048\n")
+	cue.WriteString(fmt.Sprintf("    INDEX 01 %s\n", indexMSF))
+
+	if err := os.WriteFile(cuePath, []byte(cue.String()), 0644); err != nil {
+		os.Remove(binPath)
+		return "", "", fmt.Errorf("write CUE: %w", err)
+	}
+
+	_ = totalSectors
 	return cuePath, binPath, nil
 }
 
