@@ -32,12 +32,6 @@ A cross-platform disc burning and image management tool with a beautiful termina
 ## Installation
 
 ```bash
-go install NeoBurningGoom@latest
-```
-
-Or build from source:
-
-```bash
 git clone https://github.com/DevSpace88/NeoBurningGoom.git
 cd NeoBurningGoom
 go build -o neo .
