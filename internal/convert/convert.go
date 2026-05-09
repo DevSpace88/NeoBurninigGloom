@@ -24,6 +24,8 @@ func SupportedConversions(format img.Format) []string {
 		return []string{"ISO"}
 	case img.FormatBIN:
 		return []string{"ISO"}
+	case img.FormatGDI:
+		return []string{"CUE/BIN", "ISO"}
 	default:
 		return nil
 	}
@@ -60,6 +62,8 @@ func convertToCUEBIN(srcPath, outputPath string, srcFormat img.Format) ([]string
 			return nil, err
 		}
 		return []string{cue, bin}, nil
+	case img.FormatGDI:
+		return GDIToCUE(srcPath, outputPath)
 	default:
 		return nil, fmt.Errorf("conversion from %s to CUE/BIN not yet supported", srcFormat)
 	}
@@ -71,6 +75,8 @@ func convertToISO(srcPath, outputPath string, srcFormat img.Format) ([]string, e
 		return CUEToISO(srcPath, outputPath)
 	case img.FormatBIN:
 		return BINToISO(srcPath, outputPath)
+	case img.FormatGDI:
+		return GDIToISO(srcPath, outputPath)
 	default:
 		return nil, fmt.Errorf("conversion from %s to ISO not yet supported", srcFormat)
 	}
@@ -489,4 +495,157 @@ func lbaToMSF(lba int64) string {
 	sec := (lba / 75) % 60
 	frm := lba % 75
 	return fmt.Sprintf("%02d:%02d:%02d", min, sec, frm)
+}
+
+// GDI to CUE/BIN converter.
+// Merges all GDI track files into a single BIN and writes a CUE sheet.
+
+func GDIToCUE(gdiPath, outputPath string) ([]string, error) {
+	gdi, err := img.ParseGDI(gdiPath)
+	if err != nil {
+		return nil, fmt.Errorf("parse GDI: %w", err)
+	}
+
+	if len(gdi.Tracks) == 0 {
+		return nil, fmt.Errorf("GDI has no tracks")
+	}
+
+	gdiDir := filepath.Dir(gdiPath)
+
+	if outputPath == "" {
+		base := strings.TrimSuffix(filepath.Base(gdiPath), filepath.Ext(gdiPath))
+		outputPath = filepath.Join(gdiDir, base+".bin")
+	}
+	if !strings.HasSuffix(strings.ToLower(outputPath), ".bin") &&
+		!strings.HasSuffix(strings.ToLower(outputPath), ".img") {
+		outputPath += ".bin"
+	}
+
+	base := outputPath
+	if idx := strings.LastIndex(base, "."); idx >= 0 {
+		base = base[:idx]
+	}
+	cuePath := base + ".cue"
+
+	binFile, err := os.Create(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("create BIN: %w", err)
+	}
+	defer binFile.Close()
+
+	binName := filepath.Base(outputPath)
+
+	var cue strings.Builder
+	cue.WriteString(fmt.Sprintf("FILE \"%s\" BINARY\n", binName))
+
+	for i, track := range gdi.Tracks {
+		trackPath := filepath.Join(gdiDir, track.Filename)
+
+		mode := "AUDIO"
+		if track.Flags == 4 {
+			mode = "MODE2/2352"
+			if track.SectorSize == 2048 {
+				mode = "MODE1/2048"
+			}
+		}
+
+		cue.WriteString(fmt.Sprintf("  TRACK %02d %s\n", track.Number, mode))
+
+		if i == 0 && track.Flags != 4 {
+			cue.WriteString("    PREGAP 00:02:00\n")
+		}
+
+		cue.WriteString(fmt.Sprintf("    INDEX 01 %s\n", lbaToMSF(track.StartLBA)))
+
+		tf, err := os.Open(trackPath)
+		if err != nil {
+			return nil, fmt.Errorf("open track %d (%s): %w", track.Number, track.Filename, err)
+		}
+		if _, err := io.Copy(binFile, tf); err != nil {
+			tf.Close()
+			return nil, fmt.Errorf("copy track %d: %w", track.Number, err)
+		}
+		tf.Close()
+	}
+
+	if err := os.WriteFile(cuePath, []byte(cue.String()), 0644); err != nil {
+		return nil, fmt.Errorf("write CUE: %w", err)
+	}
+
+	return []string{cuePath, outputPath}, nil
+}
+
+// GDI to ISO converter.
+// Extracts user data from the data track (usually track 3, LBA 45000).
+
+func GDIToISO(gdiPath, outputPath string) ([]string, error) {
+	gdi, err := img.ParseGDI(gdiPath)
+	if err != nil {
+		return nil, fmt.Errorf("parse GDI: %w", err)
+	}
+
+	gdiDir := filepath.Dir(gdiPath)
+
+	var dataTrack *img.GDITrack
+	for i := range gdi.Tracks {
+		if gdi.Tracks[i].Flags == 4 {
+			if dataTrack == nil || gdi.Tracks[i].FileSize > dataTrack.FileSize {
+				dataTrack = &gdi.Tracks[i]
+			}
+		}
+	}
+	if dataTrack == nil {
+		return nil, fmt.Errorf("no data track found in GDI")
+	}
+
+	trackPath := filepath.Join(gdiDir, dataTrack.Filename)
+
+	if outputPath == "" {
+		base := strings.TrimSuffix(filepath.Base(gdiPath), filepath.Ext(gdiPath))
+		outputPath = filepath.Join(gdiDir, base+".iso")
+	}
+	if !strings.HasSuffix(strings.ToLower(outputPath), ".iso") {
+		outputPath += ".iso"
+	}
+
+	trackFile, err := os.Open(trackPath)
+	if err != nil {
+		return nil, fmt.Errorf("open data track: %w", err)
+	}
+	defer trackFile.Close()
+
+	isoFile, err := os.Create(outputPath)
+	if err != nil {
+		return nil, fmt.Errorf("create ISO: %w", err)
+	}
+	defer isoFile.Close()
+
+	if dataTrack.SectorSize == 2048 {
+		_, err = io.Copy(isoFile, trackFile)
+		if err != nil {
+			return nil, fmt.Errorf("copy: %w", err)
+		}
+	} else {
+		offset := 16
+		if dataTrack.SectorSize == 2336 {
+			offset = 8
+		} else if dataTrack.SectorSize == 2352 {
+			offset = 16
+		}
+
+		buf := make([]byte, dataTrack.SectorSize)
+		for {
+			if _, err := io.ReadFull(trackFile, buf); err != nil {
+				if err == io.ErrUnexpectedEOF || err == io.EOF {
+					break
+				}
+				return nil, fmt.Errorf("read sector: %w", err)
+			}
+			if _, err := isoFile.Write(buf[offset : offset+2048]); err != nil {
+				return nil, fmt.Errorf("write sector: %w", err)
+			}
+		}
+	}
+
+	return []string{outputPath}, nil
 }
