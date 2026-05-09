@@ -16,6 +16,7 @@ import (
 
 	img "NeoBurningGoom/internal/image"
 	"NeoBurningGoom/internal/convert"
+	"NeoBurningGoom/internal/drive"
 )
 
 var (
@@ -79,6 +80,7 @@ type mainModel struct {
 func New() *mainModel {
 	items := []list.Item{
 		menuItem{title: "🔥 Burn Image", desc: "Burn a disc image (ISO, CDI, CUE/BIN, NRG) to CD/DVD"},
+		menuItem{title: "📀 Dump Disc to Image", desc: "Read a CD/DVD and save as ISO or BIN/CUE image"},
 		menuItem{title: "📂 Analyze Image", desc: "Read and display details of a disc image file"},
 		menuItem{title: "💿 Drive Status", desc: "Show optical drive info and media status"},
 		menuItem{title: "🔄 Convert Image", desc: "Convert between image formats (CDI → CUE/BIN, etc.)"},
@@ -177,6 +179,10 @@ func (m *mainModel) handleMenuChoice(title string) (tea.Model, tea.Cmd) {
 		model := newBurnModel(m.width, m.height)
 		m.sessions = append(m.sessions, session{state: model})
 		return m, model.Init()
+	case strings.Contains(title, "Dump Disc"):
+		model := newDumpModel(m.width, m.height)
+		m.sessions = append(m.sessions, session{state: model})
+		return m, model.Init()
 	case strings.Contains(title, "Analyze Image"):
 		model := newAnalyzeModel(m.width, m.height)
 		m.sessions = append(m.sessions, session{state: model})
@@ -247,6 +253,56 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+func findDarwinDevicePath() string {
+	if runtime.GOOS != "darwin" {
+		return ""
+	}
+	// Use drutil to find the optical drive's BSD device path
+	out, err := exec.Command("drutil", "status").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "/dev/disk") || strings.Contains(line, "/dev/rdisk") {
+			// Extract /dev/diskN
+			for _, part := range strings.Fields(line) {
+				if strings.HasPrefix(part, "/dev/disk") {
+					return part
+				}
+				if strings.HasPrefix(part, "/dev/rdisk") {
+					return strings.Replace(part, "rdisk", "disk", 1)
+				}
+			}
+		}
+	}
+	// Fallback: try diskutil list external
+	out2, err := exec.Command("diskutil", "list", "external").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out2), "\n") {
+		line = strings.TrimSpace(line)
+		if idx := strings.Index(line, "/dev/disk"); idx >= 0 {
+			dev := line[idx:]
+			for i := len("/dev/disk"); i < len(dev); i++ {
+				if dev[i] < '0' || dev[i] > '9' {
+					dev = dev[:i]
+					break
+				}
+			}
+			if dev != "/dev/disk0" {
+				// Verify it's optical
+				infoOut, err := exec.Command("diskutil", "info", dev).CombinedOutput()
+				if err == nil && (strings.Contains(string(infoOut), "Optical") || strings.Contains(string(infoOut), "CD") || strings.Contains(string(infoOut), "DVD")) {
+					return dev
+				}
+			}
+		}
+	}
+	return ""
+}
+
 func openFilePicker() (string, error) {
 	// Try zenity (Linux), osascript (macOS), or powershell (Windows)
 	switch runtime.GOOS {
@@ -276,6 +332,37 @@ func openFilePicker() (string, error) {
 		return strings.TrimSpace(string(out)), nil
 	}
 	return "", fmt.Errorf("file picker not supported on %s", runtime.GOOS)
+}
+
+func saveFilePicker(defaultName string) (string, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		out, err := exec.Command("osascript", "-e",
+			fmt.Sprintf(`POSIX path of (choose file name with prompt "Save as" default name "%s")`, defaultName)).Output()
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(out)), nil
+	case "linux":
+		out, err := exec.Command("zenity", "--file-selection",
+			"--save", "--confirm-overwrite",
+			"--title=Save as",
+			"--filename="+defaultName).Output()
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(out)), nil
+	case "windows":
+		script := fmt.Sprintf(
+			`Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.SaveFileDialog; $f.FileName = '%s'; $f.Filter = 'All Files|*.*'; if ($f.ShowDialog() -eq 'OK') { $f.FileName }`,
+			defaultName)
+		out, err := exec.Command("powershell", "-Command", script).Output()
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(out)), nil
+	}
+	return "", fmt.Errorf("save dialog not supported on %s", runtime.GOOS)
 }
 
 func expandPath(path string) string {
@@ -1187,6 +1274,217 @@ func (m *eraseModel) View() string {
 		b.WriteString(successStyle.Render("✓ " + m.result))
 		b.WriteString("\n\n")
 		b.WriteString(subtitleStyle.Render("[Enter] Done  [ESC] Back"))
+	}
+
+	if m.err != nil {
+		b.WriteString("\n\n" + errorStyle.Render(fmt.Sprintf("Error: %s", m.err)))
+		b.WriteString("\n\n" + subtitleStyle.Render("[Enter] Try again  [ESC] Back"))
+	}
+
+	return boxStyle.Render(b.String())
+}
+
+// --- Dump Disc Screen ---
+
+type dumpModel struct {
+	output    textinput.Model
+	phase     int // 0 = select format, 1 = output path, 2 = dumping, 3 = done
+	cursor    int // 0 = iso, 1 = bin/cue
+	format    string // "iso", "bin/cue"
+	loading   bool
+	spinner   spinner.Model
+	err       error
+	result    string
+	width     int
+	height    int
+	driveIdx  int
+	devicePath string // actual /dev/diskN
+}
+
+var dumpFormats = []struct {
+	key     string
+	label   string
+	desc    string
+}{
+	{"iso", "ISO", "standard disc image"},
+	{"bin/cue", "BIN/CUE", "raw dump with track info (Audio CDs, Dreamcast)"},
+}
+
+func newDumpModel(w, h int) *dumpModel {
+	ti := textinput.New()
+	ti.Placeholder = "Output file path (e.g. ~/disc.iso)"
+	ti.CharLimit = 500
+	ti.Width = 50
+
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
+
+	return &dumpModel{
+		output:     ti,
+		width:      w,
+		height:     h,
+		spinner:    s,
+		cursor:     0,
+		format:     "iso",
+		driveIdx:   0,
+		devicePath: findDarwinDevicePath(),
+	}
+}
+
+func (m *dumpModel) Init() tea.Cmd { return nil }
+
+type dumpResultMsg struct {
+	err error
+}
+
+func (m *dumpModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "esc":
+			if m.phase > 0 && m.phase < 3 {
+				m.phase--
+				return m, nil
+			}
+			return m, func() tea.Msg { return backMsg{} }
+		case "up", "k":
+			if m.phase == 0 && m.cursor > 0 {
+				m.cursor--
+				m.format = dumpFormats[m.cursor].key
+			}
+		case "down", "j":
+			if m.phase == 0 && m.cursor < len(dumpFormats)-1 {
+				m.cursor++
+				m.format = dumpFormats[m.cursor].key
+			}
+		case "1":
+			if m.phase == 0 {
+				m.cursor = 0
+				m.format = "iso"
+			}
+		case "2":
+			if m.phase == 0 {
+				m.cursor = 1
+				m.format = "bin/cue"
+			}
+		case "o":
+			if m.phase == 1 {
+				defaultName := "disc.iso"
+				if m.format == "bin/cue" {
+					defaultName = "disc.bin"
+				}
+				path, err := saveFilePicker(defaultName)
+				if err == nil && path != "" {
+					m.output.SetValue(path)
+				}
+				return m, nil
+			}
+		case "enter":
+			return m.handleDumpEnter()
+		}
+	case dumpResultMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err
+		} else {
+			m.result = fmt.Sprintf("Disc dumped to %s", m.output.Value())
+			m.phase = 3
+		}
+		return m, nil
+	case spinner.TickMsg:
+		if m.loading {
+			var cmd tea.Cmd
+			m.spinner, cmd = m.spinner.Update(msg)
+			return m, cmd
+		}
+	}
+
+	var cmd tea.Cmd
+	m.output, cmd = m.output.Update(msg)
+	return m, cmd
+}
+
+func (m *dumpModel) handleDumpEnter() (tea.Model, tea.Cmd) {
+	if m.phase == 0 {
+		m.phase = 1
+		m.output.Focus()
+		return m, textinput.Blink
+	}
+
+	if m.phase == 1 {
+		path := expandPath(m.output.Value())
+		if path == "" {
+			m.err = fmt.Errorf("please enter an output path")
+			return m, nil
+		}
+		m.phase = 2
+		m.loading = true
+		m.err = nil
+
+		return m, tea.Batch(m.spinner.Tick, func() tea.Msg {
+			progress := make(chan drive.DumpProgress)
+			go func() {
+				for range progress {
+				}
+			}()
+			err := drive.DumpDisc(drive.DumpOptions{
+				DriveIndex: m.driveIdx,
+				DevicePath: m.devicePath,
+				OutputPath: path,
+				Format:     m.format,
+			}, progress)
+			return dumpResultMsg{err: err}
+		})
+	}
+
+	m.phase = 0
+	m.result = ""
+	return m, nil
+}
+
+func (m *dumpModel) View() string {
+	var b strings.Builder
+
+	b.WriteString(titleStyle.Render(" 📀 Dump Disc to Image "))
+	b.WriteString("\n\n")
+
+	switch m.phase {
+	case 0:
+		b.WriteString("Select output format:\n\n")
+		for i, f := range dumpFormats {
+			if i == m.cursor {
+				b.WriteString(highlightStyle.Render(fmt.Sprintf("  ► %s  — %s", f.label, f.desc)))
+			} else {
+				b.WriteString(fmt.Sprintf("    %s  — %s", f.label, f.desc))
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+		b.WriteString(subtitleStyle.Render("[↑/↓] Navigate  [Enter] Continue  [ESC] Back"))
+
+	case 1:
+		b.WriteString(highlightStyle.Render(fmt.Sprintf("Format: %s", m.format)))
+		b.WriteString("\n\nOutput file path:\n\n")
+		b.WriteString(m.output.View())
+		b.WriteString("\n\n")
+		if m.format == "bin/cue" {
+			b.WriteString(subtitleStyle.Render("A .toc file will be created alongside the .bin"))
+			b.WriteString("\n\n")
+		}
+		b.WriteString(subtitleStyle.Render("[o] Browse  [Enter] Start dump  [ESC] Back"))
+
+	case 2:
+		b.WriteString(m.spinner.View() + " Reading disc...")
+		b.WriteString("\n\n")
+		b.WriteString(fmt.Sprintf("Saving to: %s", expandPath(m.output.Value())))
+		b.WriteString("\n\n")
+		b.WriteString(subtitleStyle.Render("This may take a while depending on disc size"))
+
+	case 3:
+		b.WriteString(successStyle.Render("✓ " + m.result))
+		b.WriteString("\n\n")
+		b.WriteString(subtitleStyle.Render("[Enter] Dump another  [ESC] Back"))
 	}
 
 	if m.err != nil {

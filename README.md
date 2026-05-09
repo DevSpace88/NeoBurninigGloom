@@ -6,6 +6,7 @@ A cross-platform disc burning and image management tool with a beautiful termina
 
 - **Analyze disc images** — inspect ISO, CDI, CUE/BIN, XISO, and NRG files
 - **Burn images to disc** — write any supported format to CD/DVD
+- **Dump discs to image** — read a CD/DVD and save as ISO or BIN/CUE
 - **Convert between formats** — CDI → CUE/BIN, ISO → CUE, and more
 - **Extract files from ISOs** — pull files out of ISO 9660 images
 - **Drive detection** — show optical drive info and media status
@@ -70,6 +71,7 @@ You'll get a menu-driven TUI:
  🔥 NeoBurningGoom
 
   🔥 Burn Image          Burn a disc image to CD/DVD
+  📀 Dump Disc to Image  Read a CD/DVD and save as ISO or BIN/CUE
   📂 Analyze Image       Read and display details of a disc image file
   💿 Drive Status         Show optical drive info and media status
   🔄 Convert Image        Convert between image formats
