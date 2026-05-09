@@ -16,6 +16,7 @@ import (
 
 	img "NeoBurningGoom/internal/image"
 	"NeoBurningGoom/internal/convert"
+	"NeoBurningGoom/internal/drive"
 )
 
 var (
@@ -79,6 +80,7 @@ type mainModel struct {
 func New() *mainModel {
 	items := []list.Item{
 		menuItem{title: "🔥 Burn Image", desc: "Burn a disc image (ISO, CDI, CUE/BIN, NRG) to CD/DVD"},
+		menuItem{title: "📀 Dump Disc to Image", desc: "Read a CD/DVD and save as ISO or BIN/CUE image"},
 		menuItem{title: "📂 Analyze Image", desc: "Read and display details of a disc image file"},
 		menuItem{title: "💿 Drive Status", desc: "Show optical drive info and media status"},
 		menuItem{title: "🔄 Convert Image", desc: "Convert between image formats (CDI → CUE/BIN, etc.)"},
@@ -177,6 +179,10 @@ func (m *mainModel) handleMenuChoice(title string) (tea.Model, tea.Cmd) {
 		model := newBurnModel(m.width, m.height)
 		m.sessions = append(m.sessions, session{state: model})
 		return m, model.Init()
+	case strings.Contains(title, "Dump Disc"):
+		model := newDumpModel(m.width, m.height)
+		m.sessions = append(m.sessions, session{state: model})
+		return m, model.Init()
 	case strings.Contains(title, "Analyze Image"):
 		model := newAnalyzeModel(m.width, m.height)
 		m.sessions = append(m.sessions, session{state: model})
@@ -247,6 +253,56 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
+func findDarwinDevicePath() string {
+	if runtime.GOOS != "darwin" {
+		return ""
+	}
+	// Use drutil to find the optical drive's BSD device path
+	out, err := exec.Command("drutil", "status").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "/dev/disk") || strings.Contains(line, "/dev/rdisk") {
+			// Extract /dev/diskN
+			for _, part := range strings.Fields(line) {
+				if strings.HasPrefix(part, "/dev/disk") {
+					return part
+				}
+				if strings.HasPrefix(part, "/dev/rdisk") {
+					return strings.Replace(part, "rdisk", "disk", 1)
+				}
+			}
+		}
+	}
+	// Fallback: try diskutil list external
+	out2, err := exec.Command("diskutil", "list", "external").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(out2), "\n") {
+		line = strings.TrimSpace(line)
+		if idx := strings.Index(line, "/dev/disk"); idx >= 0 {
+			dev := line[idx:]
+			for i := len("/dev/disk"); i < len(dev); i++ {
+				if dev[i] < '0' || dev[i] > '9' {
+					dev = dev[:i]
+					break
+				}
+			}
+			if dev != "/dev/disk0" {
+				// Verify it's optical
+				infoOut, err := exec.Command("diskutil", "info", dev).CombinedOutput()
+				if err == nil && (strings.Contains(string(infoOut), "Optical") || strings.Contains(string(infoOut), "CD") || strings.Contains(string(infoOut), "DVD")) {
+					return dev
+				}
+			}
+		}
+	}
+	return ""
+}
+
 func openFilePicker() (string, error) {
 	// Try zenity (Linux), osascript (macOS), or powershell (Windows)
 	switch runtime.GOOS {
@@ -278,6 +334,37 @@ func openFilePicker() (string, error) {
 	return "", fmt.Errorf("file picker not supported on %s", runtime.GOOS)
 }
 
+func saveFilePicker(defaultName string) (string, error) {
+	switch runtime.GOOS {
+	case "darwin":
+		out, err := exec.Command("osascript", "-e",
+			fmt.Sprintf(`POSIX path of (choose file name with prompt "Save as" default name "%s")`, defaultName)).Output()
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(out)), nil
+	case "linux":
+		out, err := exec.Command("zenity", "--file-selection",
+			"--save", "--confirm-overwrite",
+			"--title=Save as",
+			"--filename="+defaultName).Output()
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(out)), nil
+	case "windows":
+		script := fmt.Sprintf(
+			`Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.SaveFileDialog; $f.FileName = '%s'; $f.Filter = 'All Files|*.*'; if ($f.ShowDialog() -eq 'OK') { $f.FileName }`,
+			defaultName)
+		out, err := exec.Command("powershell", "-Command", script).Output()
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(out)), nil
+	}
+	return "", fmt.Errorf("save dialog not supported on %s", runtime.GOOS)
+}
+
 func expandPath(path string) string {
 	if strings.HasPrefix(path, "~") {
 		home, _ := os.UserHomeDir()
@@ -293,14 +380,16 @@ func expandPath(path string) string {
 // --- Analyze Screen ---
 
 type analyzeModel struct {
-	input    textinput.Model
-	result   *img.ImageInfo
-	loading  bool
-	err      error
-	width    int
-	height   int
-	spinner  spinner.Model
-	viewMode int // 0 = input, 1 = result
+	input       textinput.Model
+	result      *img.ImageInfo
+	loading     bool
+	err         error
+	width       int
+	height      int
+	spinner     spinner.Model
+	viewMode    int // 0 = input, 1 = result
+	skipNextKey bool
+	typingMode  bool
 }
 
 func newAnalyzeModel(w, h int) *analyzeModel {
@@ -315,10 +404,11 @@ func newAnalyzeModel(w, h int) *analyzeModel {
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#7D56F4"))
 
 	return &analyzeModel{
-		input:   ti,
-		width:   w,
-		height:  h,
-		spinner: s,
+		input:      ti,
+		width:      w,
+		height:     h,
+		spinner:    s,
+		typingMode: true,
 	}
 }
 
@@ -330,15 +420,61 @@ type analyzeResultMsg struct {
 }
 
 func (m *analyzeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.skipNextKey {
+		m.skipNextKey = false
+		if _, ok := msg.(tea.KeyMsg); ok {
+			return m, nil
+		}
+	}
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.typingMode {
+			switch msg.String() {
+			case "tab":
+				m.typingMode = false
+				m.input.Blur()
+				return m, nil
+			case "esc":
+				return m, func() tea.Msg { return backMsg{} }
+			case "enter":
+				if m.viewMode == 1 {
+					m.viewMode = 0
+					m.result = nil
+					m.input.Focus()
+					return m, textinput.Blink
+				}
+				path := expandPath(m.input.Value())
+				if path == "" {
+					m.err = fmt.Errorf("please enter a file path")
+					return m, nil
+				}
+				m.loading = true
+				m.err = nil
+				return m, tea.Batch(m.spinner.Tick, func() tea.Msg {
+					info, err := img.Analyze(path)
+					return analyzeResultMsg{info: info, err: err}
+				})
+			}
+			var cmd tea.Cmd
+			m.input, cmd = m.input.Update(msg)
+			return m, cmd
+		}
+		// Command mode
 		switch msg.String() {
+		case "tab":
+			if m.viewMode == 0 {
+				m.typingMode = true
+				m.input.Focus()
+				return m, textinput.Blink
+			}
 		case "esc":
 			return m, func() tea.Msg { return backMsg{} }
 		case "enter":
 			if m.viewMode == 1 {
 				m.viewMode = 0
 				m.result = nil
+				m.input.Focus()
+				m.typingMode = true
 				return m, textinput.Blink
 			}
 			path := expandPath(m.input.Value())
@@ -357,6 +493,7 @@ func (m *analyzeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				path, err := openFilePicker()
 				if err == nil && path != "" {
 					m.input.SetValue(path)
+					m.skipNextKey = true
 				}
 				return m, nil
 			}
@@ -377,10 +514,7 @@ func (m *analyzeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 	}
-
-	var cmd tea.Cmd
-	m.input, cmd = m.input.Update(msg)
-	return m, cmd
+	return m, nil
 }
 
 func (m *analyzeModel) View() string {
@@ -422,10 +556,18 @@ func (m *analyzeModel) View() string {
 		b.WriteString("\n")
 		b.WriteString(subtitleStyle.Render("Press Enter to analyze another, ESC to go back"))
 	} else {
+		modeHint := "[Tab] Type"
+		if m.typingMode {
+			modeHint = "[Tab] Commands"
+		}
 		b.WriteString("Enter path to disc image file:\n\n")
 		b.WriteString(m.input.View())
 		b.WriteString("\n\n")
-		b.WriteString(subtitleStyle.Render("Press [o] to open file picker, Enter to analyze, ESC to go back"))
+		if m.typingMode {
+			b.WriteString(subtitleStyle.Render(modeHint + "  [Enter] Analyze  [ESC] Back"))
+		} else {
+			b.WriteString(subtitleStyle.Render(modeHint + "  [o] Browse  [Enter] Analyze  [ESC] Back"))
+		}
 
 		if m.loading {
 			b.WriteString("\n\n")
@@ -443,19 +585,21 @@ func (m *analyzeModel) View() string {
 // --- Burn Screen ---
 
 type burnModel struct {
-	input      textinput.Model
-	speedInput textinput.Model
-	phase      int // 0 = path input, 1 = options, 2 = burning
-	imageInfo  *img.ImageInfo
-	loading    bool
-	result     string
-	err        error
-	width      int
-	height     int
-	spinner    spinner.Model
-	dryRun     bool
-	verify     bool
-	eject      bool
+	input       textinput.Model
+	speedInput  textinput.Model
+	phase       int // 0 = path input, 1 = options, 2 = burning
+	imageInfo   *img.ImageInfo
+	loading     bool
+	result      string
+	err         error
+	width       int
+	height      int
+	spinner     spinner.Model
+	dryRun      bool
+	verify      bool
+	eject       bool
+	skipNextKey bool
+	typingMode  bool
 }
 
 func newBurnModel(w, h int) *burnModel {
@@ -481,6 +625,7 @@ func newBurnModel(w, h int) *burnModel {
 		height:     h,
 		spinner:    s,
 		eject:      true,
+		typingMode: true,
 	}
 }
 
@@ -491,9 +636,56 @@ type burnResultMsg struct {
 }
 
 func (m *burnModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.skipNextKey {
+		m.skipNextKey = false
+		if _, ok := msg.(tea.KeyMsg); ok {
+			return m, nil
+		}
+	}
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.typingMode {
+			switch msg.String() {
+			case "tab":
+				m.typingMode = false
+				if m.phase == 0 {
+					m.input.Blur()
+				} else if m.phase == 1 {
+					m.speedInput.Blur()
+				}
+				return m, nil
+			case "esc":
+				if m.phase > 0 {
+					m.phase--
+					if m.phase == 0 {
+						m.input.Focus()
+					}
+					return m, textinput.Blink
+				}
+				return m, func() tea.Msg { return backMsg{} }
+			case "enter":
+				return m.handleBurnEnter()
+			}
+			var cmd tea.Cmd
+			if m.phase == 0 {
+				m.input, cmd = m.input.Update(msg)
+			} else if m.phase == 1 {
+				m.speedInput, cmd = m.speedInput.Update(msg)
+			}
+			return m, cmd
+		}
+		// Command mode
 		switch msg.String() {
+		case "tab":
+			m.typingMode = true
+			if m.phase == 0 {
+				m.input.Focus()
+				return m, textinput.Blink
+			} else if m.phase == 1 {
+				m.speedInput.Focus()
+				return m, textinput.Blink
+			}
+			return m, nil
 		case "esc":
 			if m.phase > 0 {
 				m.phase--
@@ -507,6 +699,7 @@ func (m *burnModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				path, err := openFilePicker()
 				if err == nil && path != "" {
 					m.input.SetValue(path)
+					m.skipNextKey = true
 				}
 				return m, nil
 			}
@@ -540,14 +733,7 @@ func (m *burnModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 	}
-
-	var cmd tea.Cmd
-	if m.phase == 0 {
-		m.input, cmd = m.input.Update(msg)
-	} else if m.phase == 1 {
-		m.speedInput, cmd = m.speedInput.Update(msg)
-	}
-	return m, cmd
+	return m, nil
 }
 
 func (m *burnModel) handleBurnEnter() (tea.Model, tea.Cmd) {
@@ -572,6 +758,7 @@ func (m *burnModel) handleBurnEnter() (tea.Model, tea.Cmd) {
 		m.phase = 1
 		m.err = nil
 		m.speedInput.Focus()
+		m.typingMode = true
 		return m, textinput.Blink
 	}
 
@@ -602,6 +789,8 @@ func (m *burnModel) handleBurnEnter() (tea.Model, tea.Cmd) {
 	m.phase = 0
 	m.result = ""
 	m.imageInfo = nil
+	m.typingMode = true
+	m.input.Focus()
 	return m, textinput.Blink
 }
 
@@ -628,7 +817,11 @@ func (m *burnModel) View() string {
 		b.WriteString("Enter path to disc image:\n\n")
 		b.WriteString(m.input.View())
 		b.WriteString("\n\n")
-		b.WriteString(subtitleStyle.Render("[o] File picker  [Enter] Continue  [ESC] Back"))
+		if m.typingMode {
+			b.WriteString(subtitleStyle.Render("[Tab] Commands  [Enter] Continue  [ESC] Back"))
+		} else {
+			b.WriteString(subtitleStyle.Render("[Tab] Type  [o] Browse  [Enter] Continue  [ESC] Back"))
+		}
 		if m.err != nil {
 			b.WriteString("\n\n" + errorStyle.Render(fmt.Sprintf("Error: %s", m.err)))
 		}
@@ -658,7 +851,11 @@ func (m *burnModel) View() string {
 			b.WriteString(fmt.Sprintf("  %s [v] Verify after burn\n", check(m.verify)))
 			b.WriteString(fmt.Sprintf("  %s [e] Eject after burn\n", check(m.eject)))
 			b.WriteString("\n")
-			b.WriteString(subtitleStyle.Render("[Enter] Start burn  [ESC] Back"))
+			if m.typingMode {
+				b.WriteString(subtitleStyle.Render("[Tab] Commands  [Enter] Start burn  [ESC] Back"))
+			} else {
+				b.WriteString(subtitleStyle.Render("[Tab] Type  [d] Dry run  [v] Verify  [e] Eject  [Enter] Start  [ESC] Back"))
+			}
 		}
 
 	case 2:
@@ -773,27 +970,32 @@ func (m *driveStatusModel) View() string {
 // --- Convert Screen ---
 
 type convertModel struct {
-	input    textinput.Model
-	output   textinput.Model
-	phase    int // 0 = input, 1 = output, 2 = converting, 3 = done
-	format   string
-	loading  bool
-	spinner  spinner.Model
-	err      error
-	result   string
-	width    int
-	height   int
+	input       textinput.Model
+	output      textinput.Model
+	phase       int // 0 = source, 1 = target format, 2 = output path, 3 = converting, 4 = done
+	srcFormat   img.Format
+	targets     []string // available target formats
+	cursor      int      // selected target format
+	loading     bool
+	spinner     spinner.Model
+	err         error
+	result      string
+	outputFiles []string
+	width       int
+	height      int
+	skipNextKey bool
+	typingMode  bool
 }
 
 func newConvertModel(w, h int) *convertModel {
 	ti := textinput.New()
-	ti.Placeholder = "Path to source image"
+	ti.Placeholder = "Path to source image (ISO, CDI, CUE, NRG...)"
 	ti.Focus()
 	ti.CharLimit = 500
 	ti.Width = 50
 
 	oi := textinput.New()
-	oi.Placeholder = "Output path (optional)"
+	oi.Placeholder = "Output directory (leave empty = same as source)"
 	oi.CharLimit = 500
 	oi.Width = 50
 
@@ -802,50 +1004,126 @@ func newConvertModel(w, h int) *convertModel {
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
 
 	return &convertModel{
-		input:   ti,
-		output:  oi,
-		width:   w,
-		height:  h,
-		spinner: s,
+		input:      ti,
+		output:     oi,
+		width:      w,
+		height:     h,
+		spinner:    s,
+		typingMode: true,
 	}
 }
 
 func (m *convertModel) Init() tea.Cmd { return textinput.Blink }
 
 type convertResultMsg struct {
-	cuePath string
-	binPath string
-	err     error
+	outputFiles []string
+	err         error
 }
 
 func (m *convertModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.skipNextKey {
+		m.skipNextKey = false
+		if _, ok := msg.(tea.KeyMsg); ok {
+			return m, nil
+		}
+	}
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "esc":
-			if m.phase > 0 && m.phase < 3 {
-				m.phase--
+		if m.typingMode {
+			switch msg.String() {
+			case "tab":
+				m.typingMode = false
+				if m.phase == 0 {
+					m.input.Blur()
+				} else if m.phase == 2 {
+					m.output.Blur()
+				}
 				return m, nil
+			case "esc":
+				if m.phase > 0 && m.phase < 4 {
+					m.phase--
+					if m.phase == 0 {
+						m.input.Focus()
+						m.typingMode = true
+					}
+					return m, textinput.Blink
+				}
+				return m, func() tea.Msg { return backMsg{} }
+			case "enter":
+				return m.handleConvertEnter()
+			}
+			var cmd tea.Cmd
+			if m.phase == 0 {
+				m.input, cmd = m.input.Update(msg)
+			} else if m.phase == 2 {
+				m.output, cmd = m.output.Update(msg)
+			}
+			return m, cmd
+		}
+		// Command mode
+		switch msg.String() {
+		case "tab":
+			if m.phase == 0 {
+				m.typingMode = true
+				m.input.Focus()
+				return m, textinput.Blink
+			} else if m.phase == 2 {
+				m.typingMode = true
+				m.output.Focus()
+				return m, textinput.Blink
+			}
+			return m, nil
+		case "esc":
+			if m.phase > 0 && m.phase < 4 {
+				m.phase--
+				if m.phase == 0 {
+					m.input.Focus()
+					m.typingMode = true
+				}
+				return m, textinput.Blink
 			}
 			return m, func() tea.Msg { return backMsg{} }
-		case "enter":
-			return m.handleConvertEnter()
+		case "up", "k":
+			if m.phase == 1 && m.cursor > 0 {
+				m.cursor--
+			}
+		case "down", "j":
+			if m.phase == 1 && m.cursor < len(m.targets)-1 {
+				m.cursor++
+			}
 		case "o":
 			if m.phase == 0 {
 				path, err := openFilePicker()
 				if err == nil && path != "" {
 					m.input.SetValue(path)
+					m.skipNextKey = true
 				}
 				return m, nil
 			}
+			if m.phase == 2 {
+				path, err := openFilePicker()
+				if err == nil && path != "" {
+					m.output.SetValue(path)
+					m.skipNextKey = true
+				}
+				return m, nil
+			}
+		case "enter":
+			return m.handleConvertEnter()
 		}
 	case convertResultMsg:
 		m.loading = false
 		if msg.err != nil {
 			m.err = msg.err
 		} else {
-			m.result = fmt.Sprintf("Converted!\n  CUE: %s\n  BIN: %s", msg.cuePath, msg.binPath)
-			m.phase = 3
+			m.outputFiles = msg.outputFiles
+			var sb strings.Builder
+			sb.WriteString("Conversion complete!\n")
+			for _, f := range msg.outputFiles {
+				sb.WriteString(fmt.Sprintf("  → %s\n", f))
+			}
+			m.result = sb.String()
+			m.phase = 4
 		}
 		return m, nil
 	case spinner.TickMsg:
@@ -855,12 +1133,7 @@ func (m *convertModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 	}
-
-	var cmd tea.Cmd
-	if m.phase <= 1 {
-		m.input, cmd = m.input.Update(msg)
-	}
-	return m, cmd
+	return m, nil
 }
 
 func (m *convertModel) handleConvertEnter() (tea.Model, tea.Cmd) {
@@ -880,37 +1153,68 @@ func (m *convertModel) handleConvertEnter() (tea.Model, tea.Cmd) {
 			m.err = err
 			return m, nil
 		}
-		m.format = string(format)
+		m.srcFormat = format
+
+		targets := convert.SupportedConversions(format)
+		if len(targets) == 0 {
+			m.err = fmt.Errorf("no conversions available for %s format", format)
+			return m, nil
+		}
+		m.targets = targets
+		m.cursor = 0
 		m.phase = 1
 		m.err = nil
-		return m, textinput.Blink
+		return m, nil
 	}
 
 	if m.phase == 1 {
+		// Set default output path to source directory
+		srcPath := expandPath(m.input.Value())
+		srcDir := filepath.Dir(srcPath)
+		baseName := strings.TrimSuffix(filepath.Base(srcPath), filepath.Ext(srcPath))
+		target := m.targets[m.cursor]
+
+		defaultOutput := ""
+		switch target {
+		case "CUE/BIN":
+			defaultOutput = filepath.Join(srcDir, baseName+".bin")
+		case "ISO":
+			defaultOutput = filepath.Join(srcDir, baseName+"_converted.iso")
+		}
+
+		m.output.SetValue(defaultOutput)
+		m.output.Focus()
 		m.phase = 2
+		m.err = nil
+		m.typingMode = true
+		return m, textinput.Blink
+	}
+
+	if m.phase == 2 {
+		m.phase = 3
 		m.loading = true
 
 		srcPath := expandPath(m.input.Value())
 		outPath := expandPath(m.output.Value())
+		target := m.targets[m.cursor]
 
 		return m, tea.Batch(m.spinner.Tick, func() tea.Msg {
-			switch m.format {
-			case "CDI":
-				cue, bin, err := convert.CDIToCUE(srcPath, outPath)
-				return convertResultMsg{cuePath: cue, binPath: bin, err: err}
-			case "ISO":
-				cue, bin, err := convert.ISOToCUE(srcPath, outPath)
-				return convertResultMsg{cuePath: cue, binPath: bin, err: err}
-			default:
-				return convertResultMsg{err: fmt.Errorf("conversion from %s not yet supported", m.format)}
-			}
+			files, err := convert.Convert(srcPath, outPath, target)
+			return convertResultMsg{outputFiles: files, err: err}
 		})
 	}
 
 	// Done, reset
 	m.phase = 0
 	m.result = ""
-	m.format = ""
+	m.outputFiles = nil
+	m.srcFormat = ""
+	m.targets = nil
+	m.cursor = 0
+	m.input.SetValue("")
+	m.output.SetValue("")
+	m.input.Focus()
+	m.typingMode = true
 	return m, textinput.Blink
 }
 
@@ -925,18 +1229,45 @@ func (m *convertModel) View() string {
 		b.WriteString("Source image file:\n\n")
 		b.WriteString(m.input.View())
 		b.WriteString("\n\n")
-		b.WriteString(subtitleStyle.Render("[o] File picker  [Enter] Continue  [ESC] Back"))
+		if m.typingMode {
+			b.WriteString(subtitleStyle.Render("[Tab] Commands  [Enter] Continue  [ESC] Back"))
+		} else {
+			b.WriteString(subtitleStyle.Render("[Tab] Type  [o] Browse  [Enter] Continue  [ESC] Back"))
+		}
+
 	case 1:
-		b.WriteString(highlightStyle.Render(fmt.Sprintf("Converting: %s (%s)", filepath.Base(m.input.Value()), m.format)))
-		b.WriteString("\n\nOutput path (leave empty for same directory):\n\n")
+		b.WriteString(highlightStyle.Render(fmt.Sprintf("Source: %s (%s)", filepath.Base(expandPath(m.input.Value())), m.srcFormat)))
+		b.WriteString("\n\nConvert to:\n\n")
+		for i, t := range m.targets {
+			if i == m.cursor {
+				b.WriteString(highlightStyle.Render(fmt.Sprintf("  ► %s", t)))
+			} else {
+				b.WriteString(fmt.Sprintf("    %s", t))
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+		b.WriteString(subtitleStyle.Render("[↑/↓] Navigate  [Enter] Continue  [ESC] Back"))
+
+	case 2:
+		b.WriteString(highlightStyle.Render(fmt.Sprintf("%s (%s) → %s", filepath.Base(expandPath(m.input.Value())), m.srcFormat, m.targets[m.cursor])))
+		b.WriteString("\n\nOutput path:\n\n")
 		b.WriteString(m.output.View())
 		b.WriteString("\n\n")
-		b.WriteString(subtitleStyle.Render("[Enter] Start conversion  [ESC] Back"))
-	case 2:
-		b.WriteString(m.spinner.View() + " Converting...")
+		if m.typingMode {
+			b.WriteString(subtitleStyle.Render("[Tab] Commands  [Enter] Start conversion  [ESC] Back"))
+		} else {
+			b.WriteString(subtitleStyle.Render("[Tab] Type  [o] Browse  [Enter] Start conversion  [ESC] Back"))
+		}
+
 	case 3:
-		b.WriteString(successStyle.Render(m.result))
+		b.WriteString(m.spinner.View() + " Converting...")
 		b.WriteString("\n\n")
+		b.WriteString(subtitleStyle.Render(fmt.Sprintf("Converting %s → %s", m.srcFormat, m.targets[m.cursor])))
+
+	case 4:
+		b.WriteString(successStyle.Render(m.result))
+		b.WriteString("\n")
 		b.WriteString(subtitleStyle.Render("[Enter] Convert another  [ESC] Back"))
 	}
 
@@ -950,15 +1281,17 @@ func (m *convertModel) View() string {
 // --- Extract Screen ---
 
 type extractModel struct {
-	input    textinput.Model
-	destInput textinput.Model
-	phase    int
-	loading  bool
-	spinner  spinner.Model
-	err      error
-	result   string
-	width    int
-	height   int
+	input       textinput.Model
+	destInput   textinput.Model
+	phase       int
+	loading     bool
+	spinner     spinner.Model
+	err         error
+	result      string
+	width       int
+	height      int
+	skipNextKey bool
+	typingMode  bool
 }
 
 func newExtractModel(w, h int) *extractModel {
@@ -978,11 +1311,12 @@ func newExtractModel(w, h int) *extractModel {
 	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
 
 	return &extractModel{
-		input:     ti,
-		destInput: di,
-		width:     w,
-		height:    h,
-		spinner:   s,
+		input:      ti,
+		destInput:  di,
+		width:      w,
+		height:     h,
+		spinner:    s,
+		typingMode: true,
 	}
 }
 
@@ -993,25 +1327,75 @@ type extractResultMsg struct {
 }
 
 func (m *extractModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.skipNextKey {
+		m.skipNextKey = false
+		if _, ok := msg.(tea.KeyMsg); ok {
+			return m, nil
+		}
+	}
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.typingMode {
+			switch msg.String() {
+			case "tab":
+				m.typingMode = false
+				if m.phase == 0 {
+					m.input.Blur()
+				} else if m.phase == 1 {
+					m.destInput.Blur()
+				}
+				return m, nil
+			case "esc":
+				if m.phase > 0 && m.phase < 3 {
+					m.phase--
+					if m.phase == 0 {
+						m.input.Focus()
+					}
+					return m, textinput.Blink
+				}
+				return m, func() tea.Msg { return backMsg{} }
+			case "enter":
+				return m.handleExtractEnter()
+			}
+			var cmd tea.Cmd
+			if m.phase == 0 {
+				m.input, cmd = m.input.Update(msg)
+			} else if m.phase == 1 {
+				m.destInput, cmd = m.destInput.Update(msg)
+			}
+			return m, cmd
+		}
+		// Command mode
 		switch msg.String() {
+		case "tab":
+			m.typingMode = true
+			if m.phase == 0 {
+				m.input.Focus()
+			} else if m.phase == 1 {
+				m.destInput.Focus()
+			}
+			return m, textinput.Blink
 		case "esc":
 			if m.phase > 0 && m.phase < 3 {
 				m.phase--
-				return m, nil
+				if m.phase == 0 {
+					m.input.Focus()
+					m.typingMode = true
+				}
+				return m, textinput.Blink
 			}
 			return m, func() tea.Msg { return backMsg{} }
-		case "enter":
-			return m.handleExtractEnter()
 		case "o":
 			if m.phase == 0 {
 				path, err := openFilePicker()
 				if err == nil && path != "" {
 					m.input.SetValue(path)
+					m.skipNextKey = true
 				}
 				return m, nil
 			}
+		case "enter":
+			return m.handleExtractEnter()
 		}
 	case extractResultMsg:
 		m.loading = false
@@ -1029,10 +1413,7 @@ func (m *extractModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 	}
-
-	var cmd tea.Cmd
-	m.input, cmd = m.input.Update(msg)
-	return m, cmd
+	return m, nil
 }
 
 func (m *extractModel) handleExtractEnter() (tea.Model, tea.Cmd) {
@@ -1044,6 +1425,8 @@ func (m *extractModel) handleExtractEnter() (tea.Model, tea.Cmd) {
 		}
 		m.phase = 1
 		m.err = nil
+		m.destInput.Focus()
+		m.typingMode = true
 		return m, textinput.Blink
 	}
 
@@ -1064,6 +1447,8 @@ func (m *extractModel) handleExtractEnter() (tea.Model, tea.Cmd) {
 
 	m.phase = 0
 	m.result = ""
+	m.input.Focus()
+	m.typingMode = true
 	return m, textinput.Blink
 }
 
@@ -1078,13 +1463,21 @@ func (m *extractModel) View() string {
 		b.WriteString("ISO image path:\n\n")
 		b.WriteString(m.input.View())
 		b.WriteString("\n\n")
-		b.WriteString(subtitleStyle.Render("[o] File picker  [Enter] Continue  [ESC] Back"))
+		if m.typingMode {
+			b.WriteString(subtitleStyle.Render("[Tab] Commands  [Enter] Continue  [ESC] Back"))
+		} else {
+			b.WriteString(subtitleStyle.Render("[Tab] Type  [o] Browse  [Enter] Continue  [ESC] Back"))
+		}
 	case 1:
 		b.WriteString(highlightStyle.Render(fmt.Sprintf("Extracting: %s", filepath.Base(m.input.Value()))))
 		b.WriteString("\n\nDestination directory (leave empty for auto):\n\n")
 		b.WriteString(m.destInput.View())
 		b.WriteString("\n\n")
-		b.WriteString(subtitleStyle.Render("[Enter] Extract  [ESC] Back"))
+		if m.typingMode {
+			b.WriteString(subtitleStyle.Render("[Tab] Commands  [Enter] Extract  [ESC] Back"))
+		} else {
+			b.WriteString(subtitleStyle.Render("[Tab] Type  [Enter] Extract  [ESC] Back"))
+		}
 	case 2:
 		b.WriteString(m.spinner.View() + " Extracting files...")
 	case 3:
@@ -1187,6 +1580,255 @@ func (m *eraseModel) View() string {
 		b.WriteString(successStyle.Render("✓ " + m.result))
 		b.WriteString("\n\n")
 		b.WriteString(subtitleStyle.Render("[Enter] Done  [ESC] Back"))
+	}
+
+	if m.err != nil {
+		b.WriteString("\n\n" + errorStyle.Render(fmt.Sprintf("Error: %s", m.err)))
+		b.WriteString("\n\n" + subtitleStyle.Render("[Enter] Try again  [ESC] Back"))
+	}
+
+	return boxStyle.Render(b.String())
+}
+
+// --- Dump Disc Screen ---
+
+type dumpModel struct {
+	output      textinput.Model
+	phase       int // 0 = select format, 1 = output path, 2 = dumping, 3 = done
+	cursor      int // 0 = iso, 1 = bin/cue
+	format      string // "iso", "bin/cue"
+	loading     bool
+	spinner     spinner.Model
+	err         error
+	result      string
+	width       int
+	height      int
+	driveIdx    int
+	devicePath  string // actual /dev/diskN
+	skipNextKey bool
+	typingMode  bool
+}
+
+var dumpFormats = []struct {
+	key     string
+	label   string
+	desc    string
+}{
+	{"iso", "ISO", "standard disc image"},
+	{"bin/cue", "BIN/CUE", "raw dump with track info (Audio CDs, Dreamcast)"},
+}
+
+func newDumpModel(w, h int) *dumpModel {
+	ti := textinput.New()
+	ti.Placeholder = "Output file path (e.g. ~/disc.iso)"
+	ti.CharLimit = 500
+	ti.Width = 50
+
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#04B575"))
+
+	return &dumpModel{
+		output:     ti,
+		width:      w,
+		height:     h,
+		spinner:    s,
+		cursor:     0,
+		format:     "iso",
+		driveIdx:   0,
+		devicePath: findDarwinDevicePath(),
+	}
+}
+
+func (m *dumpModel) Init() tea.Cmd { return nil }
+
+type dumpResultMsg struct {
+	err error
+}
+
+func (m *dumpModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.skipNextKey {
+		m.skipNextKey = false
+		if _, ok := msg.(tea.KeyMsg); ok {
+			return m, nil
+		}
+	}
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		if m.typingMode {
+			switch msg.String() {
+			case "tab":
+				m.typingMode = false
+				m.output.Blur()
+				return m, nil
+			case "esc":
+				if m.phase > 0 && m.phase < 3 {
+					m.phase--
+					return m, nil
+				}
+				return m, func() tea.Msg { return backMsg{} }
+			case "enter":
+				return m.handleDumpEnter()
+			}
+			var cmd tea.Cmd
+			m.output, cmd = m.output.Update(msg)
+			return m, cmd
+		}
+		// Command mode
+		switch msg.String() {
+		case "tab":
+			if m.phase == 1 {
+				m.typingMode = true
+				m.output.Focus()
+				return m, textinput.Blink
+			}
+			return m, nil
+		case "esc":
+			if m.phase > 0 && m.phase < 3 {
+				m.phase--
+				return m, nil
+			}
+			return m, func() tea.Msg { return backMsg{} }
+		case "up", "k":
+			if m.phase == 0 && m.cursor > 0 {
+				m.cursor--
+				m.format = dumpFormats[m.cursor].key
+			}
+		case "down", "j":
+			if m.phase == 0 && m.cursor < len(dumpFormats)-1 {
+				m.cursor++
+				m.format = dumpFormats[m.cursor].key
+			}
+		case "1":
+			if m.phase == 0 {
+				m.cursor = 0
+				m.format = "iso"
+			}
+		case "2":
+			if m.phase == 0 {
+				m.cursor = 1
+				m.format = "bin/cue"
+			}
+		case "o":
+			if m.phase == 1 {
+				defaultName := "disc.iso"
+				if m.format == "bin/cue" {
+					defaultName = "disc.bin"
+				}
+				path, err := saveFilePicker(defaultName)
+				if err == nil && path != "" {
+					m.output.SetValue(path)
+					m.skipNextKey = true
+				}
+				return m, nil
+			}
+		case "enter":
+			return m.handleDumpEnter()
+		}
+	case dumpResultMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err
+		} else {
+			m.result = fmt.Sprintf("Disc dumped to %s", m.output.Value())
+			m.phase = 3
+		}
+		return m, nil
+	case spinner.TickMsg:
+		if m.loading {
+			var cmd tea.Cmd
+			m.spinner, cmd = m.spinner.Update(msg)
+			return m, cmd
+		}
+	}
+	return m, nil
+}
+
+func (m *dumpModel) handleDumpEnter() (tea.Model, tea.Cmd) {
+	if m.phase == 0 {
+		m.phase = 1
+		m.output.Focus()
+		m.typingMode = true
+		return m, textinput.Blink
+	}
+
+	if m.phase == 1 {
+		path := expandPath(m.output.Value())
+		if path == "" {
+			m.err = fmt.Errorf("please enter an output path")
+			return m, nil
+		}
+		m.phase = 2
+		m.loading = true
+		m.err = nil
+
+		return m, tea.Batch(m.spinner.Tick, func() tea.Msg {
+			progress := make(chan drive.DumpProgress)
+			go func() {
+				for range progress {
+				}
+			}()
+			err := drive.DumpDisc(drive.DumpOptions{
+				DriveIndex: m.driveIdx,
+				DevicePath: m.devicePath,
+				OutputPath: path,
+				Format:     m.format,
+			}, progress)
+			return dumpResultMsg{err: err}
+		})
+	}
+
+	m.phase = 0
+	m.result = ""
+	return m, nil
+}
+
+func (m *dumpModel) View() string {
+	var b strings.Builder
+
+	b.WriteString(titleStyle.Render(" 📀 Dump Disc to Image "))
+	b.WriteString("\n\n")
+
+	switch m.phase {
+	case 0:
+		b.WriteString("Select output format:\n\n")
+		for i, f := range dumpFormats {
+			if i == m.cursor {
+				b.WriteString(highlightStyle.Render(fmt.Sprintf("  ► %s  — %s", f.label, f.desc)))
+			} else {
+				b.WriteString(fmt.Sprintf("    %s  — %s", f.label, f.desc))
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+		b.WriteString(subtitleStyle.Render("[↑/↓] Navigate  [Enter] Continue  [ESC] Back"))
+
+	case 1:
+		b.WriteString(highlightStyle.Render(fmt.Sprintf("Format: %s", m.format)))
+		b.WriteString("\n\nOutput file path:\n\n")
+		b.WriteString(m.output.View())
+		b.WriteString("\n\n")
+		if m.format == "bin/cue" {
+			b.WriteString(subtitleStyle.Render("A .toc file will be created alongside the .bin"))
+			b.WriteString("\n\n")
+		}
+		if m.typingMode {
+			b.WriteString(subtitleStyle.Render("[Tab] Commands  [Enter] Start dump  [ESC] Back"))
+		} else {
+			b.WriteString(subtitleStyle.Render("[Tab] Type  [o] Browse  [Enter] Start dump  [ESC] Back"))
+		}
+
+	case 2:
+		b.WriteString(m.spinner.View() + " Reading disc...")
+		b.WriteString("\n\n")
+		b.WriteString(fmt.Sprintf("Saving to: %s", expandPath(m.output.Value())))
+		b.WriteString("\n\n")
+		b.WriteString(subtitleStyle.Render("This may take a while depending on disc size"))
+
+	case 3:
+		b.WriteString(successStyle.Render("✓ " + m.result))
+		b.WriteString("\n\n")
+		b.WriteString(subtitleStyle.Render("[Enter] Dump another  [ESC] Back"))
 	}
 
 	if m.err != nil {

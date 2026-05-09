@@ -33,7 +33,7 @@ type CUETrack struct {
 }
 
 func analyzeCUE(info *ImageInfo) (*ImageInfo, error) {
-	cue, err := parseCUE(info.Path)
+	cue, err := ParseCUE(info.Path)
 	if err != nil {
 		return nil, fmt.Errorf("parse CUE: %w", err)
 	}
@@ -64,7 +64,7 @@ func analyzeCUE(info *ImageInfo) (*ImageInfo, error) {
 	info.Platform = detectCUEPlatform(tracks)
 
 	// Find and stat the BIN file for size info
-	binPath := findBINForCUE(info.Path, cue)
+	binPath := FindBINForCUE(info.Path, cue)
 	if binPath != "" {
 		if stat, err := os.Stat(binPath); err == nil {
 			info.Size = stat.Size()
@@ -84,7 +84,7 @@ func analyzeCUE(info *ImageInfo) (*ImageInfo, error) {
 	return info, nil
 }
 
-func parseCUE(path string) (*CUESheet, error) {
+func ParseCUE(path string) (*CUESheet, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -222,7 +222,7 @@ func parseMSFToLBA(msf string) int64 {
 	return int64(min*60*75 + sec*75 + frm)
 }
 
-func findBINForCUE(cuePath string, cue *CUESheet) string {
+func FindBINForCUE(cuePath string, cue *CUESheet) string {
 	dir := filepath.Dir(cuePath)
 
 	if len(cue.Tracks) > 0 && cue.Tracks[0].File != "" {
